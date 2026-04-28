@@ -1,0 +1,73 @@
+{
+  "step": 5,
+  "step_type": "large_step",
+  "context": {
+    "recent": [
+      4
+    ],
+    "elite": [
+      3,
+      2
+    ]
+  },
+  "context_metrics": {
+    "recent": [
+      {
+        "compiled": true,
+        "correct": true,
+        "speedup": 4.549714584068668,
+        "latency_ms": 0.361087721845378,
+        "task_id": "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64",
+        "error": null,
+        "stats": {
+          "reference_latency_ms": 1.6567385036012399,
+          "max_relative_error": 8.032196451464426,
+          "max_absolute_error": 0.015625,
+          "total_workloads": 23
+        }
+      }
+    ],
+    "elite": [
+      {
+        "compiled": true,
+        "correct": true,
+        "speedup": 3.044225782510351,
+        "latency_ms": 0.5732588508854741,
+        "task_id": "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64",
+        "error": null,
+        "stats": {
+          "reference_latency_ms": 1.7511343318483104,
+          "max_relative_error": 8.261933394100355,
+          "max_absolute_error": 0.015285326086956522,
+          "total_workloads": 23
+        }
+      },
+      {
+        "compiled": true,
+        "correct": true,
+        "speedup": 2.850711225023774,
+        "latency_ms": 0.5794053554534913,
+        "task_id": "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64",
+        "error": null,
+        "stats": {
+          "reference_latency_ms": 1.6660201668739318,
+          "max_relative_error": 10.040689570748288,
+          "max_absolute_error": 0.015285326086956522,
+          "total_workloads": 23
+        }
+      }
+    ]
+  },
+  "context_size": {
+    "recent": 1,
+    "elite": 2
+  },
+  "compiled": true,
+  "correct": true,
+  "speedup": 4.51304244790598,
+  "score": [
+    1,
+    1,
+    4.51304244790598
+  ]
+}

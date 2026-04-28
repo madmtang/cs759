@@ -1,0 +1,24 @@
+{
+  "step": 1,
+  "step_type": "large_step",
+  "context": {
+    "recent": [],
+    "elite": []
+  },
+  "context_metrics": {
+    "recent": [],
+    "elite": []
+  },
+  "context_size": {
+    "recent": 0,
+    "elite": 0
+  },
+  "compiled": true,
+  "correct": false,
+  "speedup": 0.0,
+  "score": [
+    1,
+    0,
+    0
+  ]
+}
