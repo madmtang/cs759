@@ -7,6 +7,7 @@
 \usepackage{graphicx}
 \usepackage{subfigure}
 \usepackage{booktabs} % for professional tables
+\usepackage{amsmath}
 
 % hyperref makes hyperlinks in the resulting PDF.
 % If your build breaks (sometimes temporarily if a hyperlink spans a page)
@@ -64,7 +65,16 @@
 \vskip 0.3in
 
 \begin{abstract}
-
+DeepSeek Sparse Attention (DSA) reduces the main attention computation in long-context
+LLM inference by selecting a fixed number of key-value entries per query token before
+running attention. This report studies the kernel-level part of that computation: given
+the selected token indices, compute the DSA attention output and log-sum-exp values for
+the DeepSeek-V3.2-Exp-style MLA/MQA layout. Starting from a PyTorch reference
+implementation, I developed three Triton proposals that progressively moved the
+computation into fused GPU kernels, changed the tiling strategy, and specialized the
+positional-key path. On the B200 benchmark suite, the best version is correct on all 23
+workloads and reaches a reported mean speedup of $4.74\times$ with average latency
+reduced from about $1.62$ ms to $0.40$ ms.
 \end{abstract}
 ]
 
@@ -82,40 +92,272 @@
 \section{Problem Statement / Introduction}
 \label{submission}
 
+The initial project proposal targeted optimized attention kernels for LLM inference,
+with sparse attention as the main case study. The motivation was that attention becomes
+one of the dominant costs in long-context inference: dense causal attention grows
+quadratically with sequence length, and even optimized dense kernels must move and
+combine a large amount of KV-cache data. The proposal therefore planned to study
+DeepSeek Sparse Attention (DSA), implement relevant Triton kernels, and benchmark
+them against a reference implementation.
 
+The final project scope narrowed in a useful way. Instead of implementing the full DSA
+pipeline, including the lightning indexer and top-$k$ selector, this work focuses on the
+core sparse-attention kernel after the selected token indices are already available. That
+is the part represented by \texttt{baselines/attention.py} and the task
+\texttt{dsa\_sparse\_attention}, with 16 query heads, 512 compressed-cache dimensions,
+64 positional-key dimensions, 2048 selected tokens, and 64-token pages. The upstream
+indexer determines which tokens should be attended to; the kernel studied here must
+efficiently gather those tokens from the paged cache, compute attention logits for all
+query heads, produce a numerically stable softmax, and return both the BF16 output and
+base-2 log-sum-exp (LSE).
+
+\subsection{DSA Background}
+
+DeepSeek-V3.2-Exp introduces DSA as a sparse-attention modification to
+DeepSeek-V3.1-Terminus \cite{deepseekv32}. The DSA design has two conceptually
+separate components. First, a lightweight indexer assigns an index score $I_{t,s}$
+between a query token $t$ and each preceding token $s$. Second, a fine-grained selector
+keeps only the key-value entries with top-$k$ index scores, and the main attention
+computation runs over this selected set. In the sparse training stage described in the
+DeepSeek-V3.2-Exp report, $k=2048$, matching the benchmark used in this project.
+
+This architecture changes the main attention complexity from $O(L^2)$ to $O(Lk)$ for
+sequence length $L$, while leaving a much smaller indexer computation upstream. The
+paper also instantiates DSA under Multi-head Latent Attention (MLA) \cite{deepseekv2}
+in an MQA-like mode \cite{shazeer2019}, where one latent key-value entry is shared
+across multiple query heads. That detail is directly reflected in the benchmark layout:
+each query token has 16 query heads, but the paged cache stores one 512-dimensional
+compressed key/value vector and one 64-dimensional positional key vector per cached
+token. This is also consistent with hardware-aware sparse-attention work that emphasizes
+aligning sparse patterns with GPU execution constraints \cite{yuan2025nsa}.
+
+\subsection{Kernel Interface}
+
+For each query token $t$ and head $h$, the reference implementation computes over
+the selected token set $S_t$ encoded by \texttt{sparse\_indices[t]}. A selected global
+token id $s$ maps to page $p=\lfloor s/64\rfloor$ and page offset $r=s\bmod 64$.
+The benchmark constants are:
+\[
+\begin{aligned}
+H &= 16,\quad d_c = 512,\quad d_r = 64, \\
+k &= 2048,\quad \text{page size} = 64.
+\end{aligned}
+\]
+The logit for one selected token is
+\[
+\ell_{t,h,s} =
+\alpha\left(
+q^c_{t,h}\cdot c_{p,r} + q^r_{t,h}\cdot k^r_{p,r}
+\right),
+\]
+where $\alpha$ is the softmax scale, $c_{p,r}$ is the compressed latent cache entry
+used as both key content and value, and $k^r_{p,r}$ is the positional key. The output is
+\[
+o_{t,h}=\sum_{s\in S_t}
+\frac{\exp(\ell_{t,h,s})}{\sum_{u\in S_t}\exp(\ell_{t,h,u})}c_{p(s),r(s)}.
+\]
+The LSE value returned by the benchmark is
+\[
+\mathrm{LSE}_{t,h}=\log_2\sum_{s\in S_t}\exp(\ell_{t,h,s}).
+\]
 
 \section{Solution Description}
 
+The baseline in \texttt{baselines/attention.py} is a PyTorch implementation with a
+token-level Python loop. For each token, it filters invalid \texttt{-1} entries, gathers
+the selected rows from the flattened paged caches, computes the two logit terms with
+matrix multiplications, runs \texttt{torch.logsumexp} and \texttt{torch.softmax}, and
+then writes the BF16 output. From a performance perspective, this materializes
+intermediate tensors such as the gathered keys, logits, and probabilities. The repeated
+gather and softmax work across 16 heads and 2048 selected tokens is the main target for
+GPU fusion.
+
+All three proposals keep the same high-level two-pass algorithm:
+
+\begin{enumerate}
+\item A stage-1 Triton kernel scans the sparse token set for each $(t,h)$ pair and
+computes a numerically stable softmax summary: the maximum logit $m$ and the
+normalizer $\sum_s\exp(\ell_s-m)$. It also writes the required base-2 LSE.
+\item A stage-2 Triton kernel rescans the same sparse token set, recomputes logits,
+normalizes them using the saved $m$ and normalizer, and accumulates the weighted
+512-dimensional value vector.
+\end{enumerate}
+
+The two-pass structure intentionally recomputes logits in stage 2. This avoids storing a
+large probability or logit tensor of shape
+\texttt{num\_tokens} $\times 16 \times 2048$, which would be expensive in both
+memory footprint and bandwidth. The cost is an additional read of the selected cache
+entries, but the benchmark shape is small enough per query/head that reducing global
+intermediate storage is the better design point.
+
+\subsection{Proposal 1: Functional Two-Stage Triton Kernel}
+
+The first proposal moved the sparse attention work into Triton. Stage 1 launches a grid
+of \texttt{(num\_tokens, 16)} programs, one program per token and query head. It scans
+the 2048 selected indices in blocks of 32, gathers the corresponding compressed cache
+and positional cache vectors through page/offset arithmetic, and updates the online
+softmax statistics. Stage 2 launches
+\texttt{(num\_tokens, 16, 8)} programs, where the third dimension splits the
+512-dimensional output into eight 64-element value tiles.
+
+This proposal establishes the important optimization boundary: the Python loop,
+intermediate gather tensors, and PyTorch softmax tensor are removed from the measured
+kernel path. The online LSE update uses base-2 exponentials internally and converts
+natural-logits through $\log_2(e)$, which matches the benchmark's base-2 LSE
+contract. The first proposal used conservative tile sizes
+\texttt{BLOCK\_K=32}, \texttt{BLOCK\_DCKV=32}, and \texttt{BLOCK\_DKPE=32}. Those
+settings made compilation and correctness easier, but they also produced many loop
+iterations: 64 sparse-index tiles per pass and 16 content-dimension tiles inside each
+logit computation.
+
+\subsection{Proposal 2: Larger K and Feature Tiles}
+
+The second proposal kept the same two-stage decomposition but changed the tile shape.
+It increased \texttt{BLOCK\_K} from 32 to 64 and increased the content and positional
+feature tiles to 64. This halves the number of sparse-index iterations per pass and also
+halves the number of content-vector tiles needed to compute each logit block. Because
+the positional key dimension is exactly 64, \texttt{BLOCK\_DKPE=64} also reduces the
+positional path to one tile.
+
+The kernel body was also simplified around this tile shape: the unused \texttt{num\_pages}
+argument was removed from the JIT kernels, the logarithm conversion factor was stored
+as a local scalar, invalid entries were masked before contributing to the softmax sum,
+and the wrapper normalized tensor contiguity and scalar \texttt{sm\_scale} handling
+before launch. The performance-relevant change is the tile enlargement: it reduces loop
+control, pointer construction, and repeated query loads while exposing a larger vector of
+selected tokens to each Triton program.
+
+\subsection{Proposal 3: KPE Specialization and Larger Sparse Tiles}
+
+The third proposal specialized the fixed 64-dimensional positional-key computation and
+increased \texttt{BLOCK\_K} from 64 to 128. Since $d_r=64$ is a benchmark constant, the
+generic loop over positional-key tiles was replaced by a single vectorized load and dot
+product in both stage 1 and stage 2. This removes loop overhead and gives the compiler a
+more direct representation of the small positional term.
+
+The larger \texttt{BLOCK\_K=128} tile reduces the number of sparse-index blocks from 32
+to 16 per pass. It also amortizes query-vector loads and softmax-update overhead over
+more selected tokens. The improvement is smaller than the Proposal 1 to Proposal 2 jump
+because the larger sparse tile increases the live working set inside each program; at
+some point, fewer loop iterations must be traded against register pressure and memory
+traffic from the gathered cache rows.
+
 \section{Overview of Results / Evaluation}
+
+The experiments were evaluated with the Modal backend described in
+\texttt{modal\_eval.py}. The configuration uses Triton on an NVIDIA B200 GPU, with
+23 benchmark workloads for the DSA sparse-attention task. Each result below compiled,
+passed numerical correctness, and was compared against the evaluator's reference
+latency for the same task. The reported speedup is the benchmark's mean of per-workload
+speedup factors, so it is not exactly the ratio of the average reference latency to the
+average proposal latency.
+
+\begin{table}[h]
+\centering
+\caption{DSA sparse-attention benchmark results on B200.}
+\label{tab:results}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lrrrr}
+\toprule
+Version & Latency (ms) & Speedup & Abs. err. & Rel. err. \\
+\midrule
+Proposal 1 & 0.803 & $2.19\times$ & 0.01023 & 0.0361 \\
+Proposal 2 & 0.483 & $3.80\times$ & 0.00435 & 0.0442 \\
+Proposal 3 & 0.401 & $4.74\times$ & 0.00306 & 0.0341 \\
+\bottomrule
+\end{tabular}%
+}
+\end{table}
+
+Proposal 1 already gives a substantial improvement because it changes the execution
+model from many PyTorch operations around gathered tensors into two GPU kernels with
+explicit tiling. Its reported mean speedup is $2.19\times$, with average latency
+$0.803$ ms compared with an average reference latency of about $1.62$ ms. The remaining
+cost comes from the small tile sizes: stage 1 and stage 2 each perform many short loops
+over both selected-token blocks and the 512-dimensional compressed cache.
+
+Proposal 2 is the largest single step. Average latency falls from $0.803$ ms to
+$0.483$ ms, a $39.8\%$ reduction, and reported mean speedup rises from $2.19\times$ to
+$3.80\times$. The reason is consistent with the kernel structure: \texttt{BLOCK\_K=64}
+reduces sparse-index loop iterations by $2\times$, and \texttt{BLOCK\_DCKV=64} reduces
+the number of content-vector chunks by $2\times$. Fewer loop iterations mean fewer
+pointer calculations, fewer masked loads of query slices, and better amortization of
+the online softmax update.
+
+Proposal 3 improves average latency further to $0.401$ ms and reaches a reported
+$4.74\times$ mean speedup. Relative to Proposal 2, this is a $17.1\%$ latency reduction.
+The fixed-size positional term is a good specialization target because every selected
+token must include the 64-dimensional positional-key dot product, but that dimension
+never changes across workloads. Increasing the sparse tile to 128 also reduces scan
+overhead. The more modest gain suggests that the kernel is approaching a balance point:
+larger tiles reduce control overhead but make each program heavier, especially because
+the selected cache rows are still gathered indirectly through sparse page indices.
+
+Overall, the best kernel reduces average latency by about $75.2\%$ relative to the
+average reference latency in the result file, while preserving correctness on all 23
+workloads. The result also illustrates an important sparse-attention lesson: once the
+algorithm has reduced the token set to a fixed top-$k$, the kernel bottleneck becomes
+efficient indirect memory access and careful tiling, not the asymptotic attention
+formula alone.
 
 \section{Deliverables}
 
 \section{Conclusions and Future Work}
 
+This project started with a broad plan to study sparse attention, top-$k$ selection, and
+Triton implementation techniques. The final work concentrated on the DSA core-attention
+kernel, which was the right level of scope for making concrete GPU-performance progress.
+The main result is an iterative Triton implementation that moves from a correct
+two-stage sparse-attention kernel to a more specialized tile shape, improving reported
+mean speedup from $2.19\times$ to $4.74\times$.
+
+The most useful optimization lesson was that the first correct GPU mapping is not enough
+for this workload. The sparse token set is fixed at 2048 entries, and each entry requires
+a 512-dimensional content dot product plus a 64-dimensional positional dot product.
+Small tiles spend too much time in loop overhead and repeated address formation. Larger
+tiles improve utilization, but only up to the point where register pressure and indirect
+cache loads begin to dominate. Specializing known constants such as the 64-dimensional
+positional key is therefore valuable because it removes overhead without changing the
+algorithm.
+
+Future work should profile the best kernel with hardware counters to separate memory
+bandwidth, L2 behavior, register pressure, and occupancy effects. The current two-pass
+design avoids storing logits, but it recomputes the content and positional dot products;
+more advanced variants could split the selected-token dimension across programs and use
+a reduction, or cache partial statistics when the extra storage is justified. Another
+direction is to optimize the upstream lightning indexer in \texttt{baselines/indexer.py}
+and study the full DSA pipeline, including FP8 dequantization and top-$k$ selection.
+Finally, this work directly uses ME759 topics: GPU thread/block decomposition, memory
+hierarchy awareness, tiling, performance benchmarking, and parallel algorithm design for
+modern ML inference.
+
 % Acknowledgements should only appear in the accepted version.
 % \section*{Acknowledgements}
 
 
-% In the unusual situation where you want a paper to appear in the
-% references without citing it in the main text, use \nocite
-\nocite{langley00}
+\begin{thebibliography}{9}
 
-\bibliography{example_paper}
-\bibliographystyle{mlsys2025}
+\bibitem[DeepSeek-AI(2025)]{deepseekv32}
+DeepSeek-AI.
+\newblock DeepSeek-V3.2-Exp: Boosting Long-Context Efficiency with DeepSeek Sparse Attention.
+\newblock Technical report, 2025.
 
+\bibitem[DeepSeek-AI(2024)]{deepseekv2}
+DeepSeek-AI.
+\newblock DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model.
+\newblock arXiv:2405.04434, 2024.
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-% SUPPLEMENTAL CONTENT AS APPENDIX AFTER REFERENCES
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-\appendix
-\section{Please add supplemental material as appendix here}
-%
-Put anything that you might normally include after the references as an appendix here, {\it not in a separate supplementary file}. Upload your final camera-ready as a single pdf, including all appendices.
+\bibitem[Shazeer(2019)]{shazeer2019}
+Noam Shazeer.
+\newblock Fast Transformer Decoding: One Write-Head is All You Need.
+\newblock arXiv:1911.02150, 2019.
 
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
-%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\bibitem[Yuan et~al.(2025)]{yuan2025nsa}
+Jingyang Yuan, Huazuo Gao, Damai Dai, and others.
+\newblock Native Sparse Attention: Hardware-Aligned and Natively Trainable Sparse Attention.
+\newblock Proceedings of ACL 2025.
+
+\end{thebibliography}
 
 
 \end{document}
