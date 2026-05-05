@@ -1,6 +1,6 @@
 # CS759 Evaluation
 
-This repository evaluates two implementations of the sparse attention task:
+This project evaluates two implementations of the sparse attention task:
 
 - Baseline: `baselines/attention.py`
 - Solution: `results/solution.py`
@@ -9,12 +9,18 @@ Evaluation is launched from `run_eval.py`. The script is intended to run on the
 Euler cluster login node and submits one Slurm GPU job per implementation. Do
 not run the benchmark workload on a local machine.
 
-## 0. Install Dependencies
-
-From the repository root, install the Python dependencies:
+Run the commands below from the `FinalProject` directory:
 
 ```bash
-pip install -r requirements.txt
+cd FinalProject
+```
+
+## 0. Install Dependencies
+
+From `FinalProject`, install the Python dependencies:
+
+```bash
+python3 -m pip install -r requirements.txt
 ```
 
 The evaluation path depends on `flashinfer-bench`, `pydantic`, `torch`, and
@@ -23,15 +29,17 @@ The evaluation path depends on `flashinfer-bench`, `pydantic`, `torch`, and
 
 ## 1. Download the Dataset
 
-Download the contest dataset into `datasets/mlsys26-contest`:
+Download the contest dataset into the repository-level
+`../datasets/mlsys26-contest` path:
 
 ```bash
-mkdir datasets
+mkdir -p ../datasets
 git lfs install
-git clone https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest datasets/mlsys26-contest
+git clone https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest ../datasets/mlsys26-contest
 ```
 
-The final dataset path should contain a `definitions/` directory. If
+The final dataset path should contain a `definitions/` directory. The
+repository-level `datasets/` directory is ignored by the root `.gitignore`. If
 `definitions/` is missing, the dataset was not cloned to the expected location
 or Git LFS did not fetch the required files.
 
@@ -56,7 +64,7 @@ dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64
 The quickest start:
 
 ```bash
-python run_eval.py --dataset-root datasets/mlsys26-contest/
+python3 run_eval.py --dataset-root ../datasets/mlsys26-contest/
 ```
 
 The script submits each implementation as a separate Slurm job with these
@@ -73,8 +81,8 @@ cuda module: nvidia/cuda/13.0.0
 If Euler requires different settings, override them on the command line:
 
 ```bash
-python run_eval.py \
-  --dataset-root datasets/mlsys26-contest/ \
+python3 run_eval.py \
+  --dataset-root ../datasets/mlsys26-contest/ \
   --slurm-partition instruction \
   --slurm-gres gpu:1 \
   --slurm-time 30
@@ -84,8 +92,8 @@ If you use a virtual environment or need extra module setup inside each Slurm
 job, pass a shell snippet with `--slurm-setup`:
 
 ```bash
-python run_eval.py \
-  --dataset-root datasets/mlsys26-contest/ \
+python3 run_eval.py \
+  --dataset-root ../datasets/mlsys26-contest/ \
   --slurm-setup "source .venv/bin/activate"
 ```
 
@@ -120,13 +128,13 @@ Use `--fail-on-error` to make the script exit nonzero if either implementation
 fails compilation or correctness:
 
 ```bash
-python run_eval.py --dataset-root datasets/mlsys26-contest/ --fail-on-error
+python3 run_eval.py --dataset-root ../datasets/mlsys26-contest/ --fail-on-error
 ```
 
 Use `--slurm-keep-jobs` to keep generated Slurm job directories for debugging:
 
 ```bash
-python run_eval.py --dataset-root datasets/mlsys26-contest/ --slurm-keep-jobs
+python3 run_eval.py --dataset-root ../datasets/mlsys26-contest/ --slurm-keep-jobs
 ```
 
 Kept job directories are written under:
@@ -145,7 +153,7 @@ that `--dataset-root` points to the trace-set root, not just the parent
 `datasets/` directory. The correct path should normally be:
 
 ```text
-datasets/mlsys26-contest/
+../datasets/mlsys26-contest/
 ```
 
 If `sbatch` is not found, run the script from the Euler cluster environment
