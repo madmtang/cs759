@@ -1,0 +1,52 @@
+{
+  "created_at": "2026-05-05T05:13:17.948075+00:00",
+  "task_id": "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64",
+  "dataset_root": "/srv/home/mtang76/cs759/datasets",
+  "backend": "triton",
+  "timeout": 60,
+  "slurm": {
+    "partition": "instruction",
+    "gres": "gpu:1",
+    "cpus_per_task": 1,
+    "time_limit": "30",
+    "cuda_module": "nvidia/cuda/13.0.0",
+    "python": "/usr/bin/python",
+    "setup": null,
+    "work_dir": "/srv/home/mtang76/cs759/outputs/slurm_eval_jobs",
+    "poll_interval": 2.0,
+    "job_timeout": 900,
+    "keep_jobs": false,
+    "extra_sbatch_args": []
+  },
+  "implementations": {
+    "baseline": {
+      "path": "/srv/home/mtang76/cs759/baselines/attention.py",
+      "result": {
+        "compiled": false,
+        "correct": false,
+        "speedup": 0.0,
+        "latency_ms": null,
+        "task_id": "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64",
+        "error": "No evaluation results",
+        "stats": null
+      }
+    },
+    "solution": {
+      "path": "/srv/home/mtang76/cs759/results/solution.py",
+      "result": {
+        "compiled": false,
+        "correct": false,
+        "speedup": 0.0,
+        "latency_ms": null,
+        "task_id": "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64",
+        "error": "No evaluation results",
+        "stats": null
+      }
+    }
+  },
+  "comparison": {
+    "baseline_correct": false,
+    "solution_correct": false,
+    "speedup_delta": 0.0
+  }
+}
