@@ -1,1 +1,0 @@
-{"compiled": true, "correct": true, "speedup": 4.739019732036606, "latency_ms": 0.400796380120775, "task_id": "dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64", "error": null, "stats": {"reference_latency_ms": 1.6164457829102228, "max_relative_error": 0.034145441366282954, "max_absolute_error": 0.0030599677044412365, "total_workloads": 23}}
