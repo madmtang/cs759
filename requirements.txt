@@ -1,0 +1,4 @@
+pydantic
+flashinfer-bench
+torch
+triton

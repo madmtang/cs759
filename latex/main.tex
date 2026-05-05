@@ -70,11 +70,12 @@ LLM inference by selecting a fixed number of key-value entries per query token b
 running attention. This report studies the kernel-level part of that computation: given
 the selected token indices, compute the DSA attention output and log-sum-exp values for
 the DeepSeek-V3.2-Exp-style MLA/MQA layout. Starting from a PyTorch reference
-implementation, I developed three Triton proposals that progressively moved the
-computation into fused GPU kernels, changed the tiling strategy, and specialized the
-positional-key path. On the B200 benchmark suite, the best version is correct on all 23
-workloads and reaches a reported mean speedup of $4.74\times$ with average latency
-reduced from about $1.62$ ms to $0.40$ ms.
+implementation, I developed a two-stage Triton solution that materializes logits once,
+computes base-2 LSE in the first stage, and reuses the saved logits to form the output
+without recomputing query-key dot products for every value tile. On the Euler cluster
+GPU benchmark, the solution is correct on all 23 workloads and reaches a reported mean
+speedup of $26.17\times$ with average latency reduced from about $9.13$ ms to
+$0.368$ ms.
 \end{abstract}
 ]
 
@@ -172,133 +173,140 @@ intermediate tensors such as the gathered keys, logits, and probabilities. The r
 gather and softmax work across 16 heads and 2048 selected tokens is the main target for
 GPU fusion.
 
-All three proposals keep the same high-level two-pass algorithm:
+The final solution in \texttt{results/solution.py} uses two Triton kernels. The first
+kernel computes all logits and the LSE for one token-head pair. The second kernel
+computes output tiles by reusing the saved logits and gathering only the value vectors.
+This design deliberately stores a \texttt{[num\_tokens, 16, 2048]} FP32 logit tensor.
+That is a different tradeoff from a recomputation-heavy design: it spends additional
+global memory bandwidth to avoid recomputing the expensive 512-dimensional compressed
+key dot product and 64-dimensional positional-key dot product eight times, once for
+each 64-element output tile. For this benchmark, the saved-logit design is the better
+choice because each query/head has a fixed top-$k$ of 2048 and the output dimension is
+512.
 
-\begin{enumerate}
-\item A stage-1 Triton kernel scans the sparse token set for each $(t,h)$ pair and
-computes a numerically stable softmax summary: the maximum logit $m$ and the
-normalizer $\sum_s\exp(\ell_s-m)$. It also writes the required base-2 LSE.
-\item A stage-2 Triton kernel rescans the same sparse token set, recomputes logits,
-normalizes them using the saved $m$ and normalizer, and accumulates the weighted
-512-dimensional value vector.
-\end{enumerate}
+\subsection{Stage 1: Full-Top-$k$ Logit and LSE Kernel}
 
-The two-pass structure intentionally recomputes logits in stage 2. This avoids storing a
-large probability or logit tensor of shape
-\texttt{num\_tokens} $\times 16 \times 2048$, which would be expensive in both
-memory footprint and bandwidth. The cost is an additional read of the selected cache
-entries, but the benchmark shape is small enough per query/head that reducing global
-intermediate storage is the better design point.
+The first Triton kernel launches a one-dimensional grid with one program per
+$(t,h)$ pair:
+\[
+\texttt{grid1}=(\texttt{num\_tokens}\times 16).
+\]
+Inside each program, \texttt{BLOCK\_K=2048}, so the full sparse selection for that
+token is processed in one vectorized program instance. This removes the need for an
+online block-by-block softmax update over the selected-token dimension. Instead, the
+kernel computes the complete logit vector, masks invalid selected-token entries to
+$-\infty$, stores the FP32 logits, and then computes the LSE with one vector reduction:
+\[
+m=\max_s \ell_s,\qquad
+\mathrm{LSE}=\log_2\sum_s \exp(\ell_s)
+          = m\log_2(e)+\log_2\sum_s 2^{(\ell_s-m)\log_2(e)}.
+\]
+The explicit base-2 form matches the benchmark output contract and uses \texttt{exp2}
+and \texttt{log2}, which are natural operations for the LSE representation used by the
+evaluator.
 
-\subsection{Proposal 1: Functional Two-Stage Triton Kernel}
+The compressed-cache dot product is tiled with \texttt{BLOCK\_D=64}. Each program
+therefore performs eight 64-wide reductions to cover the 512-dimensional compressed
+key. The positional-key path uses \texttt{BLOCK\_PE=32}, requiring two 32-wide
+reductions for the 64-dimensional RoPE/positional component. Both parts use the same
+page/offset mapping:
+\[
+p=\lfloor s/64\rfloor,\qquad r=s\bmod 64,
+\]
+with the implementation using an equivalent bitwise offset computation because the page
+size is fixed at 64. Invalid \texttt{-1} entries are mapped to a safe index for address
+calculation but are masked out of all loads and reductions, so padding entries cannot
+affect logits or LSE values.
 
-The first proposal moved the sparse attention work into Triton. Stage 1 launches a grid
-of \texttt{(num\_tokens, 16)} programs, one program per token and query head. It scans
-the 2048 selected indices in blocks of 32, gathers the corresponding compressed cache
-and positional cache vectors through page/offset arithmetic, and updates the online
-softmax statistics. Stage 2 launches
-\texttt{(num\_tokens, 16, 8)} programs, where the third dimension splits the
-512-dimensional output into eight 64-element value tiles.
+\subsection{Stage 2: Logit Reuse for Output Tiles}
 
-This proposal establishes the important optimization boundary: the Python loop,
-intermediate gather tensors, and PyTorch softmax tensor are removed from the measured
-kernel path. The online LSE update uses base-2 exponentials internally and converts
-natural-logits through $\log_2(e)$, which matches the benchmark's base-2 LSE
-contract. The first proposal used conservative tile sizes
-\texttt{BLOCK\_K=32}, \texttt{BLOCK\_DCKV=32}, and \texttt{BLOCK\_DKPE=32}. Those
-settings made compilation and correctness easier, but they also produced many loop
-iterations: 64 sparse-index tiles per pass and 16 content-dimension tiles inside each
-logit computation.
+The second Triton kernel launches one program per token, head, and 64-dimensional output
+tile:
+\[
+\texttt{grid2}=(\texttt{num\_tokens}\times 16\times 8).
+\]
+Each program accumulates one slice of the 512-dimensional output vector. It reads the
+base-2 LSE from stage 1 and scans the selected-token dimension in \texttt{BLOCK\_K=128}
+chunks. For each chunk, it loads the stored natural-logits, converts them into softmax
+weights with
+\[
+w_s = 2^{\ell_s\log_2(e)-\mathrm{LSE}},
+\]
+gathers the corresponding value slice from the compressed cache, and accumulates
+\[
+o_{t,h,d:d+63} \mathrel{+}= \sum_s w_s c_{p(s),r(s),d:d+63}.
+\]
+Only the value path is repeated across the eight output tiles. The query-key and
+query-positional dot products are not repeated in stage 2, which is the main reason for
+materializing logits in stage 1.
 
-\subsection{Proposal 2: Larger K and Feature Tiles}
+\subsection{Kernel Specialization and Data Movement}
 
-The second proposal kept the same two-stage decomposition but changed the tile shape.
-It increased \texttt{BLOCK\_K} from 32 to 64 and increased the content and positional
-feature tiles to 64. This halves the number of sparse-index iterations per pass and also
-halves the number of content-vector tiles needed to compute each logit block. Because
-the positional key dimension is exactly 64, \texttt{BLOCK\_DKPE=64} also reduces the
-positional path to one tile.
+The implementation specializes to the fixed benchmark shape: 16 query heads,
+512-dimensional compressed cache vectors, 64-dimensional positional vectors, 2048
+selected tokens, and 64-token pages. These constants simplify program indexing and
+avoid general-shape branches inside the Triton kernels. Stage 1 uses eight warps because
+one program owns the full 2048-token logit vector and performs wide reductions. Stage 2
+uses four warps because each program handles a smaller 128-token by 64-value tile.
 
-The kernel body was also simplified around this tile shape: the unused \texttt{num\_pages}
-argument was removed from the JIT kernels, the logarithm conversion factor was stored
-as a local scalar, invalid entries were masked before contributing to the softmax sum,
-and the wrapper normalized tensor contiguity and scalar \texttt{sm\_scale} handling
-before launch. The performance-relevant change is the tile enlargement: it reduces loop
-control, pointer construction, and repeated query loads while exposing a larger vector of
-selected tokens to each Triton program.
-
-\subsection{Proposal 3: KPE Specialization and Larger Sparse Tiles}
-
-The third proposal specialized the fixed 64-dimensional positional-key computation and
-increased \texttt{BLOCK\_K} from 64 to 128. Since $d_r=64$ is a benchmark constant, the
-generic loop over positional-key tiles was replaced by a single vectorized load and dot
-product in both stage 1 and stage 2. This removes loop overhead and gives the compiler a
-more direct representation of the small positional term.
-
-The larger \texttt{BLOCK\_K=128} tile reduces the number of sparse-index blocks from 32
-to 16 per pass. It also amortizes query-vector loads and softmax-update overhead over
-more selected tokens. The improvement is smaller than the Proposal 1 to Proposal 2 jump
-because the larger sparse tile increases the live working set inside each program; at
-some point, fewer loop iterations must be traded against register pressure and memory
-traffic from the gathered cache rows.
+The wrapper also normalizes input placement and types before launching Triton. Query and
+cache tensors are made contiguous BF16 tensors on the target CUDA device, sparse indices
+are converted to contiguous INT32, and the scalar softmax scale is passed as a CUDA FP32
+scalar. This keeps the kernel body focused on the attention computation and avoids
+unexpected stride, dtype, or CPU/GPU placement mismatches during evaluation.
 
 \section{Overview of Results / Evaluation}
 
-The experiments were evaluated with the Modal backend described in
-\texttt{modal\_eval.py}. The configuration uses Triton on an NVIDIA B200 GPU, with
-23 benchmark workloads for the DSA sparse-attention task. Each result below compiled,
-passed numerical correctness, and was compared against the evaluator's reference
-latency for the same task. The reported speedup is the benchmark's mean of per-workload
-speedup factors, so it is not exactly the ratio of the average reference latency to the
-average proposal latency.
+The current results were measured on the GPU node available through the University of
+Wisconsin--Madison Euler cluster. The benchmark is the same DSA sparse-attention task
+with 23 workloads. The result file reports that the Triton solution compiled, passed
+numerical correctness, and was evaluated against the benchmark reference implementation
+on the same Euler-cluster GPU.
+
+The reported speedup is the benchmark's mean of per-workload speedup factors. This is
+slightly different from dividing the average reference latency by the average solution
+latency, but both views show the same conclusion: the final kernel substantially
+reduces runtime for this task.
 
 \begin{table}[h]
 \centering
-\caption{DSA sparse-attention benchmark results on B200.}
+\caption{DSA sparse-attention benchmark results on the Euler cluster GPU.}
 \label{tab:results}
 \resizebox{\columnwidth}{!}{%
 \begin{tabular}{lrrrr}
 \toprule
-Version & Latency (ms) & Speedup & Abs. err. & Rel. err. \\
+Implementation & Ref. latency (ms) & Latency (ms) & Speedup & Abs. err. \\
 \midrule
-Proposal 1 & 0.803 & $2.19\times$ & 0.01023 & 0.0361 \\
-Proposal 2 & 0.483 & $3.80\times$ & 0.00435 & 0.0442 \\
-Proposal 3 & 0.401 & $4.74\times$ & 0.00306 & 0.0341 \\
+Triton solution & 9.132 & 0.368 & $26.17\times$ & 0.00320 \\
 \bottomrule
 \end{tabular}%
 }
 \end{table}
 
-Proposal 1 already gives a substantial improvement because it changes the execution
-model from many PyTorch operations around gathered tensors into two GPU kernels with
-explicit tiling. Its reported mean speedup is $2.19\times$, with average latency
-$0.803$ ms compared with an average reference latency of about $1.62$ ms. The remaining
-cost comes from the small tile sizes: stage 1 and stage 2 each perform many short loops
-over both selected-token blocks and the 512-dimensional compressed cache.
+The average reference latency is $9.132$ ms, while the final Triton solution runs in
+$0.368$ ms on average. Using these averaged latencies directly, the runtime is reduced
+by about $96.0\%$. The benchmark's reported mean speedup is $26.17\times$, which is
+larger than the ratio of the two averages because the evaluator averages per-workload
+speedup factors. The correctness statistics remain within the evaluator tolerance: the
+reported absolute error is $0.00320$ and the reported relative error is $0.04477$.
 
-Proposal 2 is the largest single step. Average latency falls from $0.803$ ms to
-$0.483$ ms, a $39.8\%$ reduction, and reported mean speedup rises from $2.19\times$ to
-$3.80\times$. The reason is consistent with the kernel structure: \texttt{BLOCK\_K=64}
-reduces sparse-index loop iterations by $2\times$, and \texttt{BLOCK\_DCKV=64} reduces
-the number of content-vector chunks by $2\times$. Fewer loop iterations mean fewer
-pointer calculations, fewer masked loads of query slices, and better amortization of
-the online softmax update.
+The performance result is consistent with the design choices in the solution. Stage 1
+does the expensive query-cache and query-positional dot products exactly once per
+token/head and writes the resulting logits. Stage 2 then uses those logits for all eight
+output tiles, so the only repeated work is reading probabilities and value slices. This
+is a good fit for the DSA benchmark because the selected-token dimension is large
+($k=2048$) and the value dimension is also large (512). Recomputing logits for every
+output tile would repeat the 576-dimensional dot-product path eight times, while the
+stored-logit design replaces that repeated arithmetic with a sequential FP32 logit read.
 
-Proposal 3 improves average latency further to $0.401$ ms and reaches a reported
-$4.74\times$ mean speedup. Relative to Proposal 2, this is a $17.1\%$ latency reduction.
-The fixed-size positional term is a good specialization target because every selected
-token must include the 64-dimensional positional-key dot product, but that dimension
-never changes across workloads. Increasing the sparse tile to 128 also reduces scan
-overhead. The more modest gain suggests that the kernel is approaching a balance point:
-larger tiles reduce control overhead but make each program heavier, especially because
-the selected cache rows are still gathered indirectly through sparse page indices.
-
-Overall, the best kernel reduces average latency by about $75.2\%$ relative to the
-average reference latency in the result file, while preserving correctness on all 23
-workloads. The result also illustrates an important sparse-attention lesson: once the
-algorithm has reduced the token set to a fixed top-$k$, the kernel bottleneck becomes
-efficient indirect memory access and careful tiling, not the asymptotic attention
-formula alone.
+The remaining bottleneck is likely the indirect gather pattern from the paged KV cache.
+Sparse token ids can point to arbitrary pages and offsets, so the kernel cannot rely on
+the same memory coalescing pattern as dense attention over contiguous sequence blocks.
+The final implementation reduces overhead around this gather by specializing constants,
+using fixed 64-wide value tiles, and avoiding unnecessary shape-general code in the
+Triton kernels. The result illustrates the central kernel-level issue in DSA: after the
+algorithm has reduced attention to a fixed top-$k$, performance depends on turning
+irregular selected-token gathers into enough parallel work to keep the GPU occupied.
 
 \section{Deliverables}
 
@@ -307,26 +315,25 @@ formula alone.
 This project started with a broad plan to study sparse attention, top-$k$ selection, and
 Triton implementation techniques. The final work concentrated on the DSA core-attention
 kernel, which was the right level of scope for making concrete GPU-performance progress.
-The main result is an iterative Triton implementation that moves from a correct
-two-stage sparse-attention kernel to a more specialized tile shape, improving reported
-mean speedup from $2.19\times$ to $4.74\times$.
+The main result is a two-stage Triton implementation that stores logits once, reuses
+them across output tiles, and reaches a reported $26.17\times$ mean speedup on the
+Euler-cluster GPU benchmark.
 
-The most useful optimization lesson was that the first correct GPU mapping is not enough
-for this workload. The sparse token set is fixed at 2048 entries, and each entry requires
-a 512-dimensional content dot product plus a 64-dimensional positional dot product.
-Small tiles spend too much time in loop overhead and repeated address formation. Larger
-tiles improve utilization, but only up to the point where register pressure and indirect
-cache loads begin to dominate. Specializing known constants such as the 64-dimensional
-positional key is therefore valuable because it removes overhead without changing the
+The most useful optimization lesson was that the right memory/arithmetic tradeoff is
+shape-dependent. The sparse token set is fixed at 2048 entries, and each entry requires
+a 512-dimensional content dot product plus a 64-dimensional positional dot product. In
+this setting, storing the logits is worthwhile because it prevents stage 2 from repeating
+that dot-product work for every output tile. Specializing known constants such as the
+head count, page size, and feature dimensions also removes overhead without changing the
 algorithm.
 
 Future work should profile the best kernel with hardware counters to separate memory
 bandwidth, L2 behavior, register pressure, and occupancy effects. The current two-pass
-design avoids storing logits, but it recomputes the content and positional dot products;
-more advanced variants could split the selected-token dimension across programs and use
-a reduction, or cache partial statistics when the extra storage is justified. Another
-direction is to optimize the upstream lightning indexer in \texttt{baselines/indexer.py}
-and study the full DSA pipeline, including FP8 dequantization and top-$k$ selection.
+design stores a full FP32 logit tensor, so a natural next experiment is to compare this
+against hybrid designs that store smaller partial summaries or split the selected-token
+dimension across programs with an explicit reduction. Another direction is to optimize
+the upstream lightning indexer in \texttt{baselines/indexer.py} and study the full DSA
+pipeline, including FP8 dequantization and top-$k$ selection.
 Finally, this work directly uses ME759 topics: GPU thread/block decomposition, memory
 hierarchy awareness, tiling, performance benchmarking, and parallel algorithm design for
 modern ML inference.
